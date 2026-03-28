@@ -108,12 +108,12 @@ func waitCount(t *testing.T, hub *Hub, want int) {
 	t.Helper()
 	deadline := time.After(5 * time.Second)
 	for {
-		if hub.ClientCount() == want {
+		if hub.SubscriberCount() == want {
 			return
 		}
 		select {
 		case <-deadline:
-			t.Fatalf("ClientCount = %d, want %d (timeout)", hub.ClientCount(), want)
+			t.Fatalf("SubscriberCount = %d, want %d (timeout)", hub.SubscriberCount(), want)
 		default:
 			time.Sleep(10 * time.Millisecond)
 		}
@@ -223,9 +223,9 @@ func TestIntegration_Redis_ClientDisconnectAndReconnect(t *testing.T) {
 func TestIntegration_Redis_OnConnect(t *testing.T) {
 	t.Parallel()
 	rc := startRedis(t)
-	hub, _ := startIntegrationHub(t, rc, "test:onconnect", WithOnConnect(func(c *Client) {
+	hub, _ := startIntegrationHub(t, rc, "test:onconnect", WithOnConnect(func(sub Subscriber) {
 		data, _ := json.Marshal(NewEvent("welcome", nil))
-		c.Send(data)
+		sub.Send(data)
 	}))
 	srv := startIntegrationServer(t, hub)
 	conn := dialIntegration(t, srv.URL)

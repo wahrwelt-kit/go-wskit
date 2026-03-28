@@ -51,10 +51,10 @@ func benchDial(b *testing.B, srvURL string) *websocket.Conn {
 func benchWaitClients(b *testing.B, hub *Hub, want int) {
 	b.Helper()
 	deadline := time.After(5 * time.Second)
-	for hub.ClientCount() != want {
+	for hub.SubscriberCount() != want {
 		select {
 		case <-deadline:
-			b.Fatalf("ClientCount = %d, want %d", hub.ClientCount(), want)
+			b.Fatalf("SubscriberCount = %d, want %d", hub.SubscriberCount(), want)
 		default:
 			time.Sleep(time.Millisecond)
 		}
@@ -81,8 +81,7 @@ func BenchmarkHub_Broadcast_1Client(b *testing.B) {
 	}()
 	time.Sleep(20 * time.Millisecond)
 
-	b.ResetTimer()
-	for range b.N {
+	for b.Loop() {
 		hub.Broadcast(msg)
 	}
 	b.StopTimer()
@@ -108,8 +107,7 @@ func BenchmarkHub_Broadcast_10Clients(b *testing.B) {
 	benchWaitClients(b, hub, 10)
 
 	msg := []byte(`{"type":"bench"}`)
-	b.ResetTimer()
-	for range b.N {
+	for b.Loop() {
 		hub.Broadcast(msg)
 	}
 	b.StopTimer()
@@ -135,8 +133,7 @@ func BenchmarkHub_Broadcast_100Clients(b *testing.B) {
 	benchWaitClients(b, hub, 100)
 
 	msg := []byte(`{"type":"bench"}`)
-	b.ResetTimer()
-	for range b.N {
+	for b.Loop() {
 		hub.Broadcast(msg)
 	}
 	b.StopTimer()
@@ -161,8 +158,7 @@ func BenchmarkHub_BroadcastEvent(b *testing.B) {
 	time.Sleep(20 * time.Millisecond)
 
 	ev := NewEvent("bench", nil)
-	b.ResetTimer()
-	for range b.N {
+	for b.Loop() {
 		hub.BroadcastEvent(context.Background(), ev)
 	}
 	b.StopTimer()
@@ -186,47 +182,102 @@ func BenchmarkHub_BroadcastJSON(b *testing.B) {
 	}()
 	time.Sleep(20 * time.Millisecond)
 
-	b.ResetTimer()
-	for range b.N {
+	for b.Loop() {
 		hub.BroadcastJSON(context.Background(), "bench", nil)
 	}
 	b.StopTimer()
 }
 
 func BenchmarkNewEvent(b *testing.B) {
-	for range b.N {
+	for b.Loop() {
 		NewEvent("bench", map[string]string{"key": "value"})
 	}
 }
 
 func BenchmarkEvent_Marshal(b *testing.B) {
 	ev := NewEvent("bench", map[string]string{"key": "value"})
-	b.ResetTimer()
-	for range b.N {
+	for b.Loop() {
 		json.Marshal(ev)
 	}
 }
 
 func BenchmarkClient_Send(b *testing.B) {
-	c := &Client{send: make(chan []byte, 4096)}
+	c := &Client{send: make(chan []byte, 4096), done: make(chan struct{})}
 	data := []byte(`{"type":"bench"}`)
 	go func() {
-		for range c.send {
+		for range c.send { //nolint:revive
 		}
 	}()
-	b.ResetTimer()
-	for range b.N {
+	for b.Loop() {
 		c.Send(data)
 	}
 }
 
 func BenchmarkHub_RegisterUnregister(b *testing.B) {
 	hub, _ := benchHub(b)
-	b.ResetTimer()
-	for range b.N {
-		c := &Client{send: make(chan []byte, 1)}
+	for b.Loop() {
+		c := &Client{send: make(chan []byte, 1), done: make(chan struct{})}
 		hub.Register(c)
 		hub.Unregister(c)
+	}
+	b.StopTimer()
+}
+
+func BenchmarkSSEClient_Send(b *testing.B) {
+	hub := NewHub()
+	c := NewSSEClient(hub, 4096)
+	data := []byte(`{"type":"bench"}`)
+	go func() {
+		for range c.send { //nolint:revive
+		}
+	}()
+	for b.Loop() {
+		c.Send(data)
+	}
+}
+
+func BenchmarkHub_Broadcast_MixedSubscribers(b *testing.B) {
+	hub, _ := benchHub(b)
+	srv := benchServer(b, hub)
+
+	// Add 5 WS clients
+	for range 5 {
+		conn := benchDial(b, srv.URL)
+		go func() {
+			for {
+				ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+				_, _, err := conn.Read(ctx)
+				cancel()
+				if err != nil {
+					return
+				}
+			}
+		}()
+	}
+
+	// Add 5 SSE clients
+	for range 5 {
+		c := NewSSEClient(hub, 256)
+		hub.Register(c)
+		go func() {
+			for {
+				select {
+				case _, ok := <-c.send:
+					if !ok {
+						return
+					}
+				case <-c.done:
+					return
+				}
+			}
+		}()
+	}
+
+	benchWaitClients(b, hub, 10)
+
+	msg := []byte(`{"type":"bench"}`)
+	for b.Loop() {
+		hub.Broadcast(msg)
 	}
 	b.StopTimer()
 }

@@ -9,16 +9,18 @@ import (
 	"github.com/coder/websocket"
 )
 
+// DefaultWriteWait is the timeout for writing a single message or ping frame to the WebSocket connection
 const (
-	DefaultWriteWait      = 10 * time.Second
-	DefaultPingInterval   = 30 * time.Second
-	DefaultMaxMessageSize = 512
-	DefaultSendBufSize    = 256
+	DefaultWriteWait      = 10 * time.Second // Timeout for writing a single message or ping frame to the WebSocket connection
+	DefaultPingInterval   = 30 * time.Second // Interval between outgoing ping frames to keep the connection alive
+	DefaultMaxMessageSize = 512              // Maximum allowed size of a single incoming message in bytes
+	DefaultSendBufSize    = 256              // Default send channel buffer size (number of messages) for Client and SSEClient
 )
 
-// ClientOption configures a Client.
+// ClientOption configures a Client
 type ClientOption func(*ClientConfig)
 
+// ClientConfig holds configuration parameters for a Client or SSEClient
 type ClientConfig struct {
 	WriteWait      time.Duration
 	PingInterval   time.Duration
@@ -39,47 +41,53 @@ func applyClientOptions(opts []ClientOption) ClientConfig {
 	return cfg
 }
 
-// WithWriteWait sets the timeout for writing a message or ping.
+// WithWriteWait sets the timeout for writing a message or ping
 func WithWriteWait(d time.Duration) ClientOption {
 	return func(c *ClientConfig) {
 		c.WriteWait = d
 	}
 }
 
-// WithPingInterval sets the interval between ping frames.
+// WithPingInterval sets the interval between ping frames
 func WithPingInterval(d time.Duration) ClientOption {
 	return func(c *ClientConfig) {
 		c.PingInterval = d
 	}
 }
 
-// WithMaxMessageSize sets the maximum size of a single incoming message.
+// WithMaxMessageSize sets the maximum size of a single incoming message
 func WithMaxMessageSize(n int64) ClientOption {
 	return func(c *ClientConfig) {
 		c.MaxMessageSize = n
 	}
 }
 
-// WithSendBufSize sets the send channel buffer size.
+// WithSendBufSize sets the send channel buffer size
 func WithSendBufSize(n int) ClientOption {
 	return func(c *ClientConfig) {
 		c.SendBufSize = n
 	}
 }
 
-// Client represents a single WebSocket connection attached to a Hub.
+// Client represents a single WebSocket connection attached to a Hub
+// It implements the Subscriber interface
 type Client struct {
-	hub        *Hub
-	conn       *websocket.Conn
-	send       chan []byte
-	ctx        context.Context
-	closeOnce  sync.Once
-	writeWait  time.Duration
-	pingInt    time.Duration
-	sendClosed atomic.Bool
+	hub           *Hub
+	conn          *websocket.Conn
+	send          chan []byte
+	done          chan struct{}
+	ctx           context.Context
+	closeOnce     sync.Once
+	connCloseOnce sync.Once
+	writeWait     time.Duration
+	pingInt       time.Duration
+	sendClosed    atomic.Bool
 }
 
-// NewClient creates a client for the given hub and connection. Call Register on the hub, then run ReadPump and WritePump in separate goroutines.
+// compile-time interface check
+var _ Subscriber = (*Client)(nil)
+
+// NewClient creates a client for the given hub and connection. Call Register on the hub, then run ReadPump and WritePump in separate goroutines
 func NewClient(hub *Hub, conn *websocket.Conn, ctx context.Context, opts ...ClientOption) *Client {
 	cfg := applyClientOptions(opts)
 	if cfg.SendBufSize <= 0 {
@@ -89,6 +97,7 @@ func NewClient(hub *Hub, conn *websocket.Conn, ctx context.Context, opts ...Clie
 		hub:       hub,
 		conn:      conn,
 		send:      make(chan []byte, cfg.SendBufSize),
+		done:      make(chan struct{}),
 		ctx:       ctx,
 		writeWait: cfg.WriteWait,
 		pingInt:   cfg.PingInterval,
@@ -104,21 +113,17 @@ func NewClient(hub *Hub, conn *websocket.Conn, ctx context.Context, opts ...Clie
 }
 
 func (c *Client) closeConn() {
-	c.closeOnce.Do(func() {
+	c.connCloseOnce.Do(func() {
 		_ = c.conn.Close(websocket.StatusNormalClosure, "")
 	})
 }
 
-// Send enqueues data for writing. Non-blocking; returns false if the send buffer is full or the client is unregistered.
-func (c *Client) Send(data []byte) (sent bool) {
+// Send enqueues data for writing. Non-blocking; returns false if the send buffer
+// is full or the client has been closed
+func (c *Client) Send(data []byte) bool {
 	if c.sendClosed.Load() {
 		return false
 	}
-	defer func() {
-		if recover() != nil {
-			sent = false
-		}
-	}()
 	select {
 	case c.send <- data:
 		return true
@@ -127,7 +132,17 @@ func (c *Client) Send(data []byte) (sent bool) {
 	}
 }
 
-// SendErr is like Send but returns ErrHubStopped when the client is unregistered.
+// Close signals the client to shut down. It is idempotent and safe to call
+// from any goroutine. The underlying WebSocket connection is closed by
+// WritePump/ReadPump defers
+func (c *Client) Close() {
+	c.closeOnce.Do(func() {
+		c.sendClosed.Store(true)
+		close(c.done)
+	})
+}
+
+// SendErr is like Send but returns ErrHubStopped when the client is closed
 func (c *Client) SendErr(data []byte) error {
 	if !c.Send(data) {
 		return ErrHubStopped
@@ -135,7 +150,7 @@ func (c *Client) SendErr(data []byte) error {
 	return nil
 }
 
-// ReadPump reads messages from the connection until it closes or errors. On exit it unregisters the client and closes the connection. Run in a goroutine.
+// ReadPump reads messages from the connection until it closes or errors. On exit it unregisters the client and closes the connection. Run in a goroutine
 func (c *Client) ReadPump() {
 	defer func() {
 		c.hub.Unregister(c)
@@ -149,7 +164,7 @@ func (c *Client) ReadPump() {
 	}
 }
 
-// WritePump writes messages from the send channel and sends ping frames at the configured interval. Run in a goroutine.
+// WritePump writes messages from the send channel and sends ping frames at the configured interval. Run in a goroutine
 func (c *Client) WritePump() {
 	ticker := time.NewTicker(c.pingInt)
 	defer func() {
@@ -159,13 +174,8 @@ func (c *Client) WritePump() {
 
 	for {
 		select {
-		case message, ok := <-c.send:
+		case message := <-c.send:
 			ctx, cancel := context.WithTimeout(c.ctx, c.writeWait)
-			if !ok {
-				cancel()
-				c.closeConn()
-				return
-			}
 			w, err := c.conn.Writer(ctx, websocket.MessageText)
 			if err != nil {
 				cancel()
@@ -187,6 +197,8 @@ func (c *Client) WritePump() {
 				return
 			}
 			cancel()
+		case <-c.done:
+			return
 		case <-c.ctx.Done():
 			return
 		}

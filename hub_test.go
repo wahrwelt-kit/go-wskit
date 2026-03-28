@@ -1,10 +1,13 @@
 package wskit
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -67,12 +70,12 @@ func waitForClients(t *testing.T, hub *Hub, want int) {
 	t.Helper()
 	deadline := time.After(2 * time.Second)
 	for {
-		if hub.ClientCount() == want {
+		if hub.SubscriberCount() == want {
 			return
 		}
 		select {
 		case <-deadline:
-			t.Fatalf("ClientCount = %d, want %d (timeout)", hub.ClientCount(), want)
+			t.Fatalf("SubscriberCount = %d, want %d (timeout)", hub.SubscriberCount(), want)
 		default:
 			time.Sleep(10 * time.Millisecond)
 		}
@@ -96,14 +99,6 @@ func TestHub_RunExitsOnCancel(t *testing.T) {
 	}
 }
 
-func TestHub_ClientCount(t *testing.T) {
-	t.Parallel()
-	hub := NewHub()
-	if hub.ClientCount() != 0 {
-		t.Errorf("ClientCount() = %d, want 0", hub.ClientCount())
-	}
-}
-
 func TestNewEvent(t *testing.T) {
 	t.Parallel()
 	ev := NewEvent("test", map[string]string{"a": "b"})
@@ -120,9 +115,9 @@ func TestNewEvent(t *testing.T) {
 
 func TestHub_OnConnect(t *testing.T) {
 	t.Parallel()
-	hub, _ := startTestHub(t, WithOnConnect(func(c *Client) {
+	hub, _ := startTestHub(t, WithOnConnect(func(sub Subscriber) {
 		data, _ := json.Marshal(NewEvent("welcome", nil))
-		c.Send(data)
+		sub.Send(data)
 	}))
 	srv := startTestServer(t, hub)
 	conn := dialWS(t, srv.URL)
@@ -251,13 +246,14 @@ func TestHub_OnTimeout(t *testing.T) {
 	hub := NewHub(
 		WithChannelTimeout(1*time.Nanosecond),
 		WithRegisterBuf(0),
-		WithOnTimeout(func(op string) {
+		WithOnTimeout(func(_ string) {
 			called.Add(1)
 		}),
 	)
 
 	for range 50 {
-		hub.Register(&Client{send: make(chan []byte, 1)})
+		c := &Client{send: make(chan []byte, 1), done: make(chan struct{})}
+		hub.Register(c)
 	}
 	time.Sleep(50 * time.Millisecond)
 	if called.Load() > 0 {
@@ -267,7 +263,7 @@ func TestHub_OnTimeout(t *testing.T) {
 
 func TestClient_Send_OK(t *testing.T) {
 	t.Parallel()
-	c := &Client{send: make(chan []byte, 1)}
+	c := &Client{send: make(chan []byte, 1), done: make(chan struct{})}
 	if !c.Send([]byte("hello")) {
 		t.Fatal("Send should return true")
 	}
@@ -275,7 +271,7 @@ func TestClient_Send_OK(t *testing.T) {
 
 func TestClient_Send_BufferFull(t *testing.T) {
 	t.Parallel()
-	c := &Client{send: make(chan []byte)}
+	c := &Client{send: make(chan []byte), done: make(chan struct{})}
 	if c.Send([]byte("hello")) {
 		t.Fatal("Send should return false on full buffer")
 	}
@@ -283,9 +279,8 @@ func TestClient_Send_BufferFull(t *testing.T) {
 
 func TestClient_Send_AfterClose(t *testing.T) {
 	t.Parallel()
-	c := &Client{send: make(chan []byte, 1)}
-	c.sendClosed.Store(true)
-	close(c.send)
+	c := &Client{send: make(chan []byte, 1), done: make(chan struct{})}
+	c.Close()
 	if c.Send([]byte("hello")) {
 		t.Fatal("Send should return false after close")
 	}
@@ -293,18 +288,17 @@ func TestClient_Send_AfterClose(t *testing.T) {
 
 func TestClient_SendErr_Closed(t *testing.T) {
 	t.Parallel()
-	c := &Client{send: make(chan []byte, 1)}
-	c.sendClosed.Store(true)
-	close(c.send)
+	c := &Client{send: make(chan []byte, 1), done: make(chan struct{})}
+	c.Close()
 	err := c.SendErr([]byte("hello"))
-	if err != ErrHubStopped {
+	if !errors.Is(err, ErrHubStopped) {
 		t.Fatalf("SendErr = %v, want ErrHubStopped", err)
 	}
 }
 
 func TestClient_SendErr_OK(t *testing.T) {
 	t.Parallel()
-	c := &Client{send: make(chan []byte, 1)}
+	c := &Client{send: make(chan []byte, 1), done: make(chan struct{})}
 	if err := c.SendErr([]byte("hello")); err != nil {
 		t.Fatalf("SendErr = %v, want nil", err)
 	}
@@ -414,5 +408,330 @@ func TestHub_BroadcastEvent_NoRedis_Fallback(t *testing.T) {
 	readJSON(t, conn, &ev)
 	if ev.Type != "local" {
 		t.Fatalf("expected local, got %q", ev.Type)
+	}
+}
+
+func TestSubscriber_ClientImplements(t *testing.T) {
+	t.Parallel()
+	var _ Subscriber = (*Client)(nil)
+}
+
+func TestSubscriber_SSEClientImplements(t *testing.T) {
+	t.Parallel()
+	var _ Subscriber = (*SSEClient)(nil)
+}
+
+func TestClient_Close_Idempotent(t *testing.T) {
+	t.Parallel()
+	c := &Client{send: make(chan []byte, 1), done: make(chan struct{})}
+	c.Close()
+	c.Close()
+	if !c.sendClosed.Load() {
+		t.Fatal("sendClosed should be true after Close")
+	}
+}
+
+func TestClient_Send_NoPanicAfterClose(t *testing.T) {
+	t.Parallel()
+	c := &Client{send: make(chan []byte, 1), done: make(chan struct{})}
+	c.Close()
+	for range 100 {
+		if c.Send([]byte("data")) {
+			t.Fatal("Send should return false after Close")
+		}
+	}
+}
+
+func TestClient_WritePump_ExitsOnDone(t *testing.T) {
+	t.Parallel()
+
+	hub, _ := startTestHub(t)
+	srv := startTestServer(t, hub)
+	conn := dialWS(t, srv.URL)
+	_ = conn
+	waitForClients(t, hub, 1)
+}
+
+func TestHub_OnDisconnect(t *testing.T) {
+	t.Parallel()
+	var disconnected atomic.Int32
+	hub, _ := startTestHub(t, WithOnDisconnect(func(_ Subscriber) {
+		disconnected.Add(1)
+	}))
+	srv := startTestServer(t, hub)
+	conn := dialWS(t, srv.URL)
+	waitForClients(t, hub, 1)
+
+	conn.Close(websocket.StatusNormalClosure, "bye")
+	waitForClients(t, hub, 0)
+
+	deadline := time.After(2 * time.Second)
+	for disconnected.Load() == 0 {
+		select {
+		case <-deadline:
+			t.Fatal("OnDisconnect not called (timeout)")
+		default:
+			time.Sleep(10 * time.Millisecond)
+		}
+	}
+	if disconnected.Load() != 1 {
+		t.Fatalf("OnDisconnect called %d times, want 1", disconnected.Load())
+	}
+}
+
+func TestHub_SubscriberCount(t *testing.T) {
+	t.Parallel()
+	hub, _ := startTestHub(t)
+	srv := startTestServer(t, hub)
+	conn := dialWS(t, srv.URL)
+	waitForClients(t, hub, 1)
+
+	if hub.SubscriberCount() != 1 {
+		t.Fatalf("SubscriberCount = %d, want 1", hub.SubscriberCount())
+	}
+	conn.Close(websocket.StatusNormalClosure, "bye")
+	waitForClients(t, hub, 0)
+}
+
+// noFlusher wraps a ResponseWriter without exposing http.Flusher,
+// used to test AcceptSSE on a non-streaming response writer
+type noFlusher struct{ http.ResponseWriter }
+
+func TestNewSSEClient_DefaultBufSize(t *testing.T) {
+	t.Parallel()
+	hub := NewHub()
+	c := NewSSEClient(hub, 0)
+	if cap(c.send) != DefaultSendBufSize {
+		t.Fatalf("bufSize=0: cap(send) = %d, want %d", cap(c.send), DefaultSendBufSize)
+	}
+	c2 := NewSSEClient(hub, -1)
+	if cap(c2.send) != DefaultSendBufSize {
+		t.Fatalf("bufSize=-1: cap(send) = %d, want %d", cap(c2.send), DefaultSendBufSize)
+	}
+}
+
+func TestAcceptSSE_FlusherNotSupported(t *testing.T) {
+	t.Parallel()
+	hub := NewHub()
+	r := httptest.NewRequest(http.MethodGet, "/sse", nil)
+	w := httptest.NewRecorder()
+	err := AcceptSSE(&noFlusher{w}, r, hub)
+	if !errors.Is(err, ErrFlusherNotSupported) {
+		t.Fatalf("err = %v, want ErrFlusherNotSupported", err)
+	}
+}
+
+func TestAcceptSSE_ContextCancelled(t *testing.T) {
+	t.Parallel()
+	hub, _ := startTestHub(t)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	errCh := make(chan error, 1)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		errCh <- AcceptSSE(w, r.WithContext(ctx), hub)
+	}))
+	t.Cleanup(srv.Close)
+
+	resp, err := http.Get(srv.URL)
+	if err != nil {
+		t.Fatalf("GET: %v", err)
+	}
+	resp.Body.Close()
+
+	select {
+	case got := <-errCh:
+		if !errors.Is(got, context.Canceled) {
+			t.Fatalf("err = %v, want context.Canceled", got)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timeout waiting for AcceptSSE to return")
+	}
+}
+
+func TestSSEClient_Send_OK(t *testing.T) {
+	t.Parallel()
+	hub := NewHub()
+	c := NewSSEClient(hub, 1)
+	if !c.Send([]byte("hello")) {
+		t.Fatal("Send should return true")
+	}
+}
+
+func TestSSEClient_Send_BufferFull(t *testing.T) {
+	t.Parallel()
+	hub := NewHub()
+	c := NewSSEClient(hub, 1)
+	c.Send([]byte("fill"))
+	if c.Send([]byte("overflow")) {
+		t.Fatal("Send should return false when buffer is full")
+	}
+}
+
+func TestSSEClient_Send_AfterClose(t *testing.T) {
+	t.Parallel()
+	hub := NewHub()
+	c := NewSSEClient(hub, 1)
+	c.Close()
+	if c.Send([]byte("hello")) {
+		t.Fatal("Send should return false after Close")
+	}
+}
+
+func TestSSEClient_Close_Idempotent(t *testing.T) {
+	t.Parallel()
+	hub := NewHub()
+	c := NewSSEClient(hub, 1)
+	c.Close()
+	c.Close()
+	if !c.sendClosed.Load() {
+		t.Fatal("sendClosed should be true after Close")
+	}
+}
+
+func TestAcceptSSE_BasicFlow(t *testing.T) {
+	t.Parallel()
+	hub, _ := startTestHub(t)
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		AcceptSSE(w, r, hub)
+	}))
+	t.Cleanup(srv.Close)
+
+	resp, err := http.Get(srv.URL)
+	if err != nil {
+		t.Fatalf("GET: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if ct := resp.Header.Get("Content-Type"); ct != "text/event-stream" {
+		t.Fatalf("Content-Type = %q, want text/event-stream", ct)
+	}
+
+	waitForClients(t, hub, 1)
+
+	hub.Broadcast([]byte(`{"type":"sse-test"}`))
+
+	scanner := bufio.NewScanner(resp.Body)
+	deadline := time.After(2 * time.Second)
+	var got string
+	for {
+		select {
+		case <-deadline:
+			t.Fatal("timeout reading SSE event")
+		default:
+		}
+		if scanner.Scan() {
+			line := scanner.Text()
+			if after, ok := strings.CutPrefix(line, "data: "); ok {
+				got = after
+				break
+			}
+		} else {
+			if err := scanner.Err(); err != nil {
+				t.Fatalf("scanner: %v", err)
+			}
+		}
+	}
+
+	var ev Event
+	if err := json.Unmarshal([]byte(got), &ev); err != nil {
+		t.Fatalf("unmarshal SSE: %v", err)
+	}
+	if ev.Type != "sse-test" {
+		t.Fatalf("expected sse-test, got %q", ev.Type)
+	}
+}
+
+func TestAcceptSSE_HubShutdown(t *testing.T) {
+	t.Parallel()
+	hub, cancel := startTestHub(t)
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		AcceptSSE(w, r, hub)
+	}))
+	t.Cleanup(srv.Close)
+
+	resp, err := http.Get(srv.URL)
+	if err != nil {
+		t.Fatalf("GET: %v", err)
+	}
+	defer resp.Body.Close()
+
+	waitForClients(t, hub, 1)
+
+	cancel()
+
+	deadline := time.After(2 * time.Second)
+	done := make(chan struct{})
+	go func() {
+		buf := make([]byte, 256)
+		for {
+			_, err := resp.Body.Read(buf)
+			if err != nil {
+				close(done)
+				return
+			}
+		}
+	}()
+	select {
+	case <-done:
+	case <-deadline:
+		t.Fatal("SSE connection did not close after hub shutdown (timeout)")
+	}
+}
+
+func TestHub_MixedSubscribers(t *testing.T) {
+	t.Parallel()
+	hub, _ := startTestHub(t)
+
+	srv := startTestServer(t, hub)
+	wsConn := dialWS(t, srv.URL)
+	waitForClients(t, hub, 1)
+
+	sseSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		AcceptSSE(w, r, hub)
+	}))
+	t.Cleanup(sseSrv.Close)
+
+	resp, err := http.Get(sseSrv.URL)
+	if err != nil {
+		t.Fatalf("GET SSE: %v", err)
+	}
+	defer resp.Body.Close()
+
+	waitForClients(t, hub, 2)
+
+	hub.Broadcast([]byte(`{"type":"mixed"}`))
+
+	var ev Event
+	readJSON(t, wsConn, &ev)
+	if ev.Type != "mixed" {
+		t.Fatalf("WS: expected mixed, got %q", ev.Type)
+	}
+
+	scanner := bufio.NewScanner(resp.Body)
+	deadline := time.After(2 * time.Second)
+	for {
+		select {
+		case <-deadline:
+			t.Fatal("timeout reading SSE event")
+		default:
+		}
+		if scanner.Scan() {
+			line := scanner.Text()
+			if after, ok := strings.CutPrefix(line, "data: "); ok {
+				got := after
+				var sseEv Event
+				if err := json.Unmarshal([]byte(got), &sseEv); err != nil {
+					t.Fatalf("unmarshal SSE: %v", err)
+				}
+				if sseEv.Type != "mixed" {
+					t.Fatalf("SSE: expected mixed, got %q", sseEv.Type)
+				}
+				return
+			}
+		}
 	}
 }
