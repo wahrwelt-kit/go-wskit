@@ -159,7 +159,7 @@ func BenchmarkHub_BroadcastEvent(b *testing.B) {
 
 	ev := NewEvent("bench", nil)
 	for b.Loop() {
-		hub.BroadcastEvent(context.Background(), ev)
+		hub.BroadcastEvent(context.Background(), ev) //nolint:revive // benchmark ignores errors intentionally
 	}
 	b.StopTimer()
 }
@@ -183,7 +183,7 @@ func BenchmarkHub_BroadcastJSON(b *testing.B) {
 	time.Sleep(20 * time.Millisecond)
 
 	for b.Loop() {
-		hub.BroadcastJSON(context.Background(), "bench", nil)
+		hub.BroadcastJSON(context.Background(), "bench", nil) //nolint:revive // benchmark ignores errors intentionally
 	}
 	b.StopTimer()
 }
@@ -205,7 +205,7 @@ func BenchmarkClient_Send(b *testing.B) {
 	c := &Client{send: make(chan []byte, 4096), done: make(chan struct{})}
 	data := []byte(`{"type":"bench"}`)
 	go func() {
-		for range c.send { //nolint:revive
+		for range c.send { //nolint:revive // intentional empty loop to drain channel
 		}
 	}()
 	for b.Loop() {
@@ -228,7 +228,7 @@ func BenchmarkSSEClient_Send(b *testing.B) {
 	c := NewSSEClient(hub, 4096)
 	data := []byte(`{"type":"bench"}`)
 	go func() {
-		for range c.send { //nolint:revive
+		for range c.send { //nolint:revive // intentional empty loop to drain channel
 		}
 	}()
 	for b.Loop() {

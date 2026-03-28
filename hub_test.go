@@ -357,11 +357,9 @@ func TestHub_ConcurrentBroadcast(t *testing.T) {
 
 	var wg sync.WaitGroup
 	for i := range 5 {
-		wg.Add(1)
-		go func(idx int) {
-			defer wg.Done()
-			hub.BroadcastJSON(context.Background(), "msg", idx)
-		}(i)
+		wg.Go(func() {
+			hub.BroadcastJSON(context.Background(), "msg", i) //nolint:revive // test ignores broadcast errors
+		})
 	}
 	wg.Wait()
 
@@ -513,7 +511,7 @@ func TestNewSSEClient_DefaultBufSize(t *testing.T) {
 func TestAcceptSSE_FlusherNotSupported(t *testing.T) {
 	t.Parallel()
 	hub := NewHub()
-	r := httptest.NewRequest(http.MethodGet, "/sse", nil)
+	r := httptest.NewRequest(http.MethodGet, "/sse", http.NoBody)
 	w := httptest.NewRecorder()
 	err := AcceptSSE(&noFlusher{w}, r, hub)
 	if !errors.Is(err, ErrFlusherNotSupported) {
@@ -595,7 +593,7 @@ func TestAcceptSSE_BasicFlow(t *testing.T) {
 	hub, _ := startTestHub(t)
 
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		AcceptSSE(w, r, hub)
+		AcceptSSE(w, r, hub) //nolint:revive // test handler; SSE errors are expected on client disconnect
 	}))
 	t.Cleanup(srv.Close)
 
@@ -649,7 +647,7 @@ func TestAcceptSSE_HubShutdown(t *testing.T) {
 	hub, cancel := startTestHub(t)
 
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		AcceptSSE(w, r, hub)
+		AcceptSSE(w, r, hub) //nolint:revive // test handler; SSE errors are expected on client disconnect
 	}))
 	t.Cleanup(srv.Close)
 
@@ -691,7 +689,7 @@ func TestHub_MixedSubscribers(t *testing.T) {
 	waitForClients(t, hub, 1)
 
 	sseSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		AcceptSSE(w, r, hub)
+		AcceptSSE(w, r, hub) //nolint:revive // test handler; SSE errors are expected on client disconnect
 	}))
 	t.Cleanup(sseSrv.Close)
 
