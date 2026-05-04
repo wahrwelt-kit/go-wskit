@@ -536,7 +536,7 @@ func TestAcceptSSE_ContextCancelled(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GET: %v", err)
 	}
-	resp.Body.Close()
+	_ = resp.Body.Close()
 
 	select {
 	case got := <-errCh:

@@ -197,7 +197,7 @@ func BenchmarkNewEvent(b *testing.B) {
 func BenchmarkEvent_Marshal(b *testing.B) {
 	ev := NewEvent("bench", map[string]string{"key": "value"})
 	for b.Loop() {
-		json.Marshal(ev)
+		_, _ = json.Marshal(ev)
 	}
 }
 
