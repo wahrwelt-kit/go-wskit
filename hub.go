@@ -2,7 +2,11 @@ package wskit
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
+	"errors"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -28,6 +32,11 @@ type Subscriber interface {
 
 type broadcastItem struct {
 	data []byte
+}
+
+type redisEnvelope struct {
+	Origin string          `json:"origin"`
+	Data   json.RawMessage `json:"data"`
 }
 
 // HubOption configures a Hub
@@ -69,6 +78,20 @@ func WithOnTimeout(fn func(op string)) HubOption {
 	}
 }
 
+// WithOnDrop sets a callback invoked when a subscriber rejects a broadcast message
+func WithOnDrop(fn func(Subscriber, []byte)) HubOption {
+	return func(h *Hub) {
+		h.onDrop = fn
+	}
+}
+
+// WithOnError sets a callback invoked when Redis or hub operations fail asynchronously
+func WithOnError(fn func(op string, err error)) HubOption {
+	return func(h *Hub) {
+		h.onError = fn
+	}
+}
+
 // WithOnConnect sets the callback invoked when a subscriber registers
 func WithOnConnect(fn func(Subscriber)) HubOption {
 	return func(h *Hub) {
@@ -94,7 +117,10 @@ type Hub struct {
 	clientCount    int64
 	redisClient    *redis.Client
 	redisChannel   string
+	redisID        string
 	onTimeout      func(op string)
+	onDrop         func(Subscriber, []byte)
+	onError        func(op string, err error)
 	onConnect      func(Subscriber)
 	onDisconnect   func(Subscriber)
 	broadcastBuf   int
@@ -109,15 +135,39 @@ func NewHub(opts ...HubOption) *Hub {
 		broadcastBuf:   DefaultBroadcastBuf,
 		registerBuf:    DefaultRegisterBuf,
 		channelTimeout: DefaultChannelTimeout,
+		redisID:        newRedisID(),
 	}
 	for _, opt := range opts {
-		opt(h)
+		if opt != nil {
+			opt(h)
+		}
 	}
+	h.normalizeOptions()
 	h.broadcast = make(chan broadcastItem, h.broadcastBuf)
 	h.register = make(chan Subscriber, h.registerBuf)
 	h.unregister = make(chan Subscriber, h.registerBuf)
 	h.done = make(chan struct{})
 	return h
+}
+
+func newRedisID() string {
+	var b [16]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return strconv.FormatInt(time.Now().UnixNano(), 36)
+	}
+	return hex.EncodeToString(b[:])
+}
+
+func (h *Hub) normalizeOptions() {
+	if h.broadcastBuf < 0 {
+		h.broadcastBuf = DefaultBroadcastBuf
+	}
+	if h.registerBuf < 0 {
+		h.registerBuf = DefaultRegisterBuf
+	}
+	if h.channelTimeout <= 0 {
+		h.channelTimeout = DefaultChannelTimeout
+	}
 }
 
 func (h *Hub) closeDone() {
@@ -126,27 +176,44 @@ func (h *Hub) closeDone() {
 
 // Run runs the hub loop until ctx is cancelled. Closes all subscribers on exit
 func (h *Hub) Run(ctx context.Context) {
+	if h == nil {
+		return
+	}
 	defer h.closeDone()
+	if ctx == nil {
+		h.closeSubscribers()
+		return
+	}
 	for {
 		select {
 		case <-ctx.Done():
-			for sub := range h.subscribers {
-				sub.Close()
-				delete(h.subscribers, sub)
-				atomic.AddInt64(&h.clientCount, -1)
-			}
+			h.closeSubscribers()
 			return
 		case sub := <-h.register:
-			h.subscribers[sub] = struct{}{}
-			atomic.AddInt64(&h.clientCount, 1)
-			if h.onConnect != nil {
-				h.onConnect(sub)
+			if sub == nil {
+				h.reportError("register", ErrNilSubscriber)
+				continue
+			}
+			if _, exists := h.subscribers[sub]; !exists {
+				h.subscribers[sub] = struct{}{}
+				atomic.AddInt64(&h.clientCount, 1)
+				if h.onConnect != nil {
+					h.onConnect(sub)
+				}
 			}
 		case sub := <-h.unregister:
 			h.unregisterSubscriber(sub)
 		case item := <-h.broadcast:
 			h.broadcastToClients(item)
 		}
+	}
+}
+
+func (h *Hub) closeSubscribers() {
+	for sub := range h.subscribers {
+		sub.Close()
+		delete(h.subscribers, sub)
+		atomic.AddInt64(&h.clientCount, -1)
 	}
 }
 
@@ -163,102 +230,207 @@ func (h *Hub) unregisterSubscriber(sub Subscriber) {
 
 func (h *Hub) broadcastToClients(item broadcastItem) {
 	for sub := range h.subscribers {
-		sub.Send(item.data)
+		if !sub.Send(item.data) {
+			if h.onDrop != nil {
+				h.onDrop(sub, item.data)
+			}
+		}
 	}
 }
 
-func (h *Hub) sendWithTimeout(ch chan<- Subscriber, sub Subscriber, op string) {
+func (h *Hub) sendWithTimeout(ch chan<- Subscriber, sub Subscriber, op string) error {
+	if h == nil {
+		return ErrNilHub
+	}
+	if sub == nil {
+		return ErrNilSubscriber
+	}
 	t := time.NewTimer(h.channelTimeout)
 	defer t.Stop()
 	select {
 	case ch <- sub:
+		return nil
 	case <-h.done:
+		return ErrHubStopped
 	case <-t.C:
+		err := ErrOperationTimeout
 		if h.onTimeout != nil {
 			h.onTimeout(op)
 		}
+		h.reportError(op, err)
+		return err
 	}
 }
 
-func (h *Hub) broadcastWithTimeout(data []byte) {
+func (h *Hub) broadcastWithTimeout(data []byte) error {
+	if h == nil {
+		return ErrNilHub
+	}
 	t := time.NewTimer(h.channelTimeout)
 	defer t.Stop()
 	select {
 	case h.broadcast <- broadcastItem{data: data}:
+		return nil
 	case <-h.done:
+		return ErrHubStopped
 	case <-t.C:
+		err := ErrOperationTimeout
 		if h.onTimeout != nil {
 			h.onTimeout("broadcast")
 		}
+		h.reportError("broadcast", err)
+		return err
 	}
 }
 
-// Register adds the subscriber to the hub. Non-blocking with timeout
-func (h *Hub) Register(sub Subscriber) {
-	h.sendWithTimeout(h.register, sub, "register")
+// Register adds the subscriber to the hub. Non-blocking with timeout.
+func (h *Hub) Register(sub Subscriber) error {
+	if h == nil {
+		return ErrNilHub
+	}
+	return h.sendWithTimeout(h.register, sub, "register")
 }
 
-// Unregister removes the subscriber from the hub. Non-blocking with timeout
-func (h *Hub) Unregister(sub Subscriber) {
-	h.sendWithTimeout(h.unregister, sub, "unregister")
+// Unregister removes the subscriber from the hub. Non-blocking with timeout.
+func (h *Hub) Unregister(sub Subscriber) error {
+	if h == nil {
+		return ErrNilHub
+	}
+	return h.sendWithTimeout(h.unregister, sub, "unregister")
 }
 
-// Broadcast sends data to all connected subscribers. Non-blocking with timeout
-func (h *Hub) Broadcast(data []byte) {
-	h.broadcastWithTimeout(data)
+// Broadcast sends data to all connected subscribers. Non-blocking with timeout.
+func (h *Hub) Broadcast(data []byte) error {
+	payload := make([]byte, len(data))
+	copy(payload, data)
+	return h.broadcastWithTimeout(payload)
 }
 
-// BroadcastEvent marshals event as JSON and broadcasts it. If Redis is configured, publishes to Redis first; on failure falls back to local Broadcast. Returns an error only when JSON marshaling fails
+// BroadcastEvent marshals event as JSON, broadcasts it locally, and publishes it to Redis when configured.
 func (h *Hub) BroadcastEvent(ctx context.Context, event any) error {
+	if h == nil {
+		return ErrNilHub
+	}
+	if ctx == nil {
+		return ErrNilContext
+	}
 	data, err := json.Marshal(event)
 	if err != nil {
 		return err
 	}
+	localErr := h.Broadcast(data)
 	if h.redisClient != nil && h.redisChannel != "" {
 		pubCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
-		err := h.redisClient.Publish(pubCtx, h.redisChannel, data).Err()
+		err := h.redisClient.Publish(pubCtx, h.redisChannel, h.wrapRedisPayload(data)).Err()
 		cancel()
-		if err == nil {
-			return nil
+		if err != nil {
+			h.reportError("redis_publish", err)
+			return errors.Join(localErr, err)
 		}
 	}
-	h.Broadcast(data)
-	return nil
+	return localErr
 }
 
 // SubscribeToRedis subscribes to the hub's Redis channel and broadcasts received
 // messages to all clients. It automatically reconnects with exponential backoff
 // if the subscription is lost. Run in a goroutine; it returns when ctx is cancelled
 func (h *Hub) SubscribeToRedis(ctx context.Context) {
-	if h.redisClient == nil || h.redisChannel == "" {
+	if h == nil || h.redisClient == nil || h.redisChannel == "" {
+		return
+	}
+	if ctx == nil {
+		h.reportError("redis_subscribe", ErrNilContext)
 		return
 	}
 	backoff := time.Second
 	const maxBackoff = 30 * time.Second
 	for {
 		pubsub := h.redisClient.Subscribe(ctx, h.redisChannel)
+		if _, err := pubsub.Receive(ctx); err != nil {
+			h.reportError("redis_subscribe", err)
+			_ = pubsub.Close()
+			if !h.waitRedisBackoff(ctx, backoff) {
+				return
+			}
+			backoff = nextBackoff(backoff, maxBackoff)
+			continue
+		}
 		ch := pubsub.Channel()
 		for msg := range ch {
-			h.Broadcast([]byte(msg.Payload))
+			payload, ok := h.unwrapRedisPayload(msg.Payload)
+			if ok {
+				if err := h.Broadcast(payload); err != nil {
+					h.reportError("redis_broadcast", err)
+				}
+			}
 			backoff = time.Second // reset on success
 		}
-		_ = pubsub.Close()
+		if err := pubsub.Close(); err != nil {
+			h.reportError("redis_close", err)
+		}
 		if ctx.Err() != nil {
 			return
 		}
-		// Channel closed unexpectedly, reconnect with backoff
-		select {
-		case <-ctx.Done():
+		h.reportError("redis_subscribe", ErrRedisSubscriptionClosed)
+		if !h.waitRedisBackoff(ctx, backoff) {
 			return
-		case <-time.After(backoff):
 		}
-		if backoff < maxBackoff {
-			backoff *= 2
-		}
+		backoff = nextBackoff(backoff, maxBackoff)
 	}
 }
 
 // SubscriberCount returns the number of registered subscribers
 func (h *Hub) SubscriberCount() int {
+	if h == nil {
+		return 0
+	}
 	return int(atomic.LoadInt64(&h.clientCount))
+}
+
+func (h *Hub) wrapRedisPayload(data []byte) []byte {
+	payload, err := json.Marshal(redisEnvelope{
+		Origin: h.redisID,
+		Data:   json.RawMessage(data),
+	})
+	if err != nil {
+		return data
+	}
+	return payload
+}
+
+func (h *Hub) unwrapRedisPayload(payload string) ([]byte, bool) {
+	var envelope redisEnvelope
+	if err := json.Unmarshal([]byte(payload), &envelope); err == nil && len(envelope.Data) > 0 {
+		if envelope.Origin == h.redisID {
+			return nil, false
+		}
+		data := make([]byte, len(envelope.Data))
+		copy(data, envelope.Data)
+		return data, true
+	}
+	return []byte(payload), true
+}
+
+func (h *Hub) waitRedisBackoff(ctx context.Context, d time.Duration) bool {
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return false
+	case <-timer.C:
+		return true
+	}
+}
+
+func nextBackoff(current, maxValue time.Duration) time.Duration {
+	if current >= maxValue/2 {
+		return maxValue
+	}
+	return current * 2
+}
+
+func (h *Hub) reportError(op string, err error) {
+	if h != nil && h.onError != nil && err != nil {
+		h.onError(op, err)
+	}
 }

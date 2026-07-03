@@ -135,6 +135,26 @@ func TestIntegration_Redis_BroadcastEvent(t *testing.T) {
 	assert.Equal(t, "redis-event", ev.Type)
 }
 
+func TestIntegration_Redis_BroadcastEvent_NoLocalDuplicate(t *testing.T) {
+	t.Parallel()
+	rc := startRedis(t)
+	hub, _ := startIntegrationHub(t, rc, "test:no-duplicate")
+	srv := startIntegrationServer(t, hub)
+	conn := dialIntegration(t, srv.URL)
+	waitCount(t, hub, 1)
+
+	err := hub.BroadcastEvent(context.Background(), NewEvent("once", nil))
+	require.NoError(t, err)
+
+	ev := readEvent(t, conn)
+	assert.Equal(t, "once", ev.Type)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
+	defer cancel()
+	_, _, err = conn.Read(ctx)
+	require.Error(t, err)
+}
+
 func TestIntegration_Redis_BroadcastJSON(t *testing.T) {
 	t.Parallel()
 	rc := startRedis(t)

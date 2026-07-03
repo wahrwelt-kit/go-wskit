@@ -22,6 +22,7 @@ linters:
     - wsl
     - funcorder
     - godot
+    - gomodguard
     - inamedparam
     - nlreturn
     - noinlineerr

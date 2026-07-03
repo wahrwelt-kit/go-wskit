@@ -18,19 +18,25 @@ import "github.com/wahrwelt-kit/go-wskit"
 
 ## Features
 
-- **Hub** - single-goroutine dispatcher with register/unregister/broadcast channels, graceful shutdown via context, atomic subscriber count
-- **Client** - ReadPump (drain incoming) + WritePump (send + ping/pong), safe concurrent Send with close protection
-- **SSEClient** - Server-Sent Events subscriber; `AcceptSSE` registers it with the hub and streams data until disconnect or shutdown
-- **Redis Pub/Sub** - BroadcastEvent with JSON serialization, fallback to local broadcast on Redis failure, SubscribeToRedis for horizontal scaling
+- **Hub** - single-goroutine dispatcher with register/unregister/broadcast channels, graceful shutdown via context, atomic subscriber count, and explicit operation errors
+- **Client** - ReadPump (optional inbound message handler) + WritePump (send + ping), safe concurrent Send with close protection
+- **SSEClient** - Server-Sent Events subscriber; `AcceptSSE` registers it with the hub and writes protocol-safe `data:` frames until disconnect or shutdown
+- **Redis Pub/Sub** - BroadcastEvent delivers locally first, publishes to Redis for other instances, and avoids duplicate local echo from the same hub
 - **Event envelope** - `Event{Type, Payload, Timestamp}` standard JSON format, BroadcastJSON helper
 - **Accept / AcceptSSE helpers** - upgrade HTTP to WebSocket or SSE + create client + register in one call
-- **Functional options** - configurable timeouts, buffer sizes, callbacks
+- **Functional options** - configurable timeouts, buffer sizes, connect/disconnect/drop/error callbacks
 
 ## Example
 
 ```go
 hub := wskit.NewHub(
     wskit.WithRedis(redisClient, "ws:events"),
+    wskit.WithOnDrop(func(sub wskit.Subscriber, data []byte) {
+        log.Printf("dropped websocket payload: %d bytes", len(data))
+    }),
+    wskit.WithOnError(func(op string, err error) {
+        log.Printf("websocket %s: %v", op, err)
+    }),
     wskit.WithOnConnect(func(sub wskit.Subscriber) {
         data, _ := json.Marshal(wskit.NewEvent("connected", nil))
         sub.Send(data)
@@ -51,14 +57,18 @@ http.HandleFunc("/ws", func(w http.ResponseWriter, r *http.Request) {
 
 // SSE endpoint
 http.HandleFunc("/events", func(w http.ResponseWriter, r *http.Request) {
-    wskit.AcceptSSE(w, r, hub)
+    if err := wskit.AcceptSSE(w, r, hub); err != nil {
+        return
+    }
 })
 
-hub.BroadcastJSON(ctx, "notification", map[string]string{"message": "hello"})
+if err := hub.BroadcastJSON(ctx, "notification", map[string]string{"message": "hello"}); err != nil {
+    log.Printf("broadcast: %v", err)
+}
 ```
 
 ## Options
 
-**Hub:** `WithRedis`, `WithBroadcastBuf`, `WithRegisterBuf`, `WithChannelTimeout`, `WithOnTimeout`, `WithOnConnect`, `WithOnDisconnect`
+**Hub:** `WithRedis`, `WithBroadcastBuf`, `WithRegisterBuf`, `WithChannelTimeout`, `WithOnTimeout`, `WithOnDrop`, `WithOnError`, `WithOnConnect`, `WithOnDisconnect`
 
-**Client:** `WithWriteWait`, `WithPingInterval`, `WithMaxMessageSize`, `WithSendBufSize`
+**Client:** `WithWriteWait`, `WithPingInterval`, `WithMaxMessageSize`, `WithSendBufSize`, `WithMessageHandler`

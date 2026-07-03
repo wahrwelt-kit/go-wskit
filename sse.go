@@ -2,7 +2,9 @@ package wskit
 
 import (
 	"fmt"
+	"io"
 	"net/http"
+	"strings"
 	"sync"
 	"sync/atomic"
 )
@@ -10,7 +12,6 @@ import (
 // SSEClient represents a Server-Sent Events connection attached to a Hub
 // It implements the Subscriber interface
 type SSEClient struct {
-	hub        *Hub
 	send       chan []byte
 	done       chan struct{}
 	closeOnce  sync.Once
@@ -21,12 +22,11 @@ type SSEClient struct {
 var _ Subscriber = (*SSEClient)(nil)
 
 // NewSSEClient creates an SSE subscriber for the given hub with the specified buffer size
-func NewSSEClient(hub *Hub, bufSize int) *SSEClient {
+func NewSSEClient(bufSize int) *SSEClient {
 	if bufSize <= 0 {
 		bufSize = DefaultSendBufSize
 	}
 	return &SSEClient{
-		hub:  hub,
 		send: make(chan []byte, bufSize),
 		done: make(chan struct{}),
 	}
@@ -55,10 +55,36 @@ func (c *SSEClient) Close() {
 	})
 }
 
+// SendErr is like Send but reports whether the subscriber is closed or its buffer is full.
+func (c *SSEClient) SendErr(data []byte) error {
+	if c.sendClosed.Load() {
+		return ErrSubscriberClosed
+	}
+	select {
+	case <-c.done:
+		return ErrSubscriberClosed
+	case c.send <- data:
+		return nil
+	default:
+		return ErrSubscriberBufferFull
+	}
+}
+
 // AcceptSSE upgrades an HTTP request to an SSE stream. It registers with the hub,
 // writes SSE-formatted messages, and blocks until the client disconnects or the
 // hub shuts down
 func AcceptSSE(w http.ResponseWriter, r *http.Request, hub *Hub) error {
+	if w == nil {
+		return ErrNilResponseWriter
+	}
+	if r == nil {
+		http.Error(w, ErrNilRequest.Error(), http.StatusBadRequest)
+		return ErrNilRequest
+	}
+	if hub == nil {
+		http.Error(w, ErrNilHub.Error(), http.StatusInternalServerError)
+		return ErrNilHub
+	}
 	flusher, ok := w.(http.Flusher)
 	if !ok {
 		http.Error(w, "streaming not supported", http.StatusInternalServerError)
@@ -70,9 +96,12 @@ func AcceptSSE(w http.ResponseWriter, r *http.Request, hub *Hub) error {
 	w.Header().Set("Connection", "keep-alive")
 	w.Header().Set("X-Accel-Buffering", "no")
 
-	client := NewSSEClient(hub, DefaultSendBufSize)
-	hub.Register(client)
-	defer hub.Unregister(client)
+	client := NewSSEClient(DefaultSendBufSize)
+	if err := hub.Register(client); err != nil {
+		http.Error(w, err.Error(), http.StatusServiceUnavailable)
+		return err
+	}
+	defer func() { _ = hub.Unregister(client) }()
 
 	flusher.Flush() // flush headers
 
@@ -80,8 +109,7 @@ func AcceptSSE(w http.ResponseWriter, r *http.Request, hub *Hub) error {
 	for {
 		select {
 		case msg := <-client.send:
-			// Write SSE format: "data: <payload>\n\n"
-			if _, err := fmt.Fprintf(w, "data: %s\n\n", msg); err != nil {
+			if err := writeSSEData(w, msg); err != nil {
 				return err
 			}
 			flusher.Flush()
@@ -91,4 +119,21 @@ func AcceptSSE(w http.ResponseWriter, r *http.Request, hub *Hub) error {
 			return ctx.Err()
 		}
 	}
+}
+
+func writeSSEData(w io.Writer, msg []byte) error {
+	data := strings.ReplaceAll(string(msg), "\r\n", "\n")
+	data = strings.ReplaceAll(data, "\r", "\n")
+	for {
+		line, rest, found := strings.Cut(data, "\n")
+		if _, err := fmt.Fprintf(w, "data: %s\n", line); err != nil {
+			return err
+		}
+		if !found {
+			break
+		}
+		data = rest
+	}
+	_, err := io.WriteString(w, "\n")
+	return err
 }

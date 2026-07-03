@@ -82,7 +82,7 @@ func BenchmarkHub_Broadcast_1Client(b *testing.B) {
 	time.Sleep(20 * time.Millisecond)
 
 	for b.Loop() {
-		hub.Broadcast(msg)
+		_ = hub.Broadcast(msg)
 	}
 	b.StopTimer()
 }
@@ -108,7 +108,7 @@ func BenchmarkHub_Broadcast_10Clients(b *testing.B) {
 
 	msg := []byte(`{"type":"bench"}`)
 	for b.Loop() {
-		hub.Broadcast(msg)
+		_ = hub.Broadcast(msg)
 	}
 	b.StopTimer()
 }
@@ -134,7 +134,7 @@ func BenchmarkHub_Broadcast_100Clients(b *testing.B) {
 
 	msg := []byte(`{"type":"bench"}`)
 	for b.Loop() {
-		hub.Broadcast(msg)
+		_ = hub.Broadcast(msg)
 	}
 	b.StopTimer()
 }
@@ -217,15 +217,14 @@ func BenchmarkHub_RegisterUnregister(b *testing.B) {
 	hub, _ := benchHub(b)
 	for b.Loop() {
 		c := &Client{send: make(chan []byte, 1), done: make(chan struct{})}
-		hub.Register(c)
-		hub.Unregister(c)
+		_ = hub.Register(c)
+		_ = hub.Unregister(c)
 	}
 	b.StopTimer()
 }
 
 func BenchmarkSSEClient_Send(b *testing.B) {
-	hub := NewHub()
-	c := NewSSEClient(hub, 4096)
+	c := NewSSEClient(4096)
 	data := []byte(`{"type":"bench"}`)
 	go func() {
 		for range c.send { //nolint:revive // intentional empty loop to drain channel
@@ -257,8 +256,8 @@ func BenchmarkHub_Broadcast_MixedSubscribers(b *testing.B) {
 
 	// Add 5 SSE clients
 	for range 5 {
-		c := NewSSEClient(hub, 256)
-		hub.Register(c)
+		c := NewSSEClient(256)
+		_ = hub.Register(c)
 		go func() {
 			for {
 				select {
@@ -277,7 +276,7 @@ func BenchmarkHub_Broadcast_MixedSubscribers(b *testing.B) {
 
 	msg := []byte(`{"type":"bench"}`)
 	for b.Loop() {
-		hub.Broadcast(msg)
+		_ = hub.Broadcast(msg)
 	}
 	b.StopTimer()
 }
