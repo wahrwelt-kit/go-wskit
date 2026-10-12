@@ -57,8 +57,9 @@ http.HandleFunc("/ws", func(w http.ResponseWriter, r *http.Request) {
     if err != nil {
         return
     }
-    go client.ReadPump()
+    // ReadPump uses the request context, so keep this handler alive until it returns.
     go client.WritePump()
+    client.ReadPump()
 })
 
 // SSE endpoint
