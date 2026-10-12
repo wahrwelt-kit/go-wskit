@@ -2,7 +2,6 @@ package wskit
 
 import (
 	"context"
-	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -197,7 +196,7 @@ func BenchmarkNewEvent(b *testing.B) {
 func BenchmarkEvent_Marshal(b *testing.B) {
 	ev := NewEvent("bench", map[string]string{"key": "value"})
 	for b.Loop() {
-		_, _ = json.Marshal(ev)
+		_, _ = marshalJSON(ev)
 	}
 }
 

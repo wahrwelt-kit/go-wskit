@@ -2,14 +2,14 @@ package wskit
 
 import (
 	"context"
-	"crypto/rand"
-	"encoding/hex"
-	"encoding/json"
+	"encoding/json/jsontext"
+	jsonv2 "encoding/json/v2"
 	"errors"
 	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
+	"uuid"
 
 	"github.com/redis/go-redis/v9"
 )
@@ -17,7 +17,7 @@ import (
 // DefaultBroadcastBuf is the default broadcast channel buffer size (number of messages)
 const (
 	DefaultBroadcastBuf   = 256             // Default broadcast channel buffer size (number of messages)
-	DefaultRegisterBuf    = 64              // Default register/unregister channel buffer size (number of operations)
+	DefaultRegisterBuf    = 64              // Default shared register/unregister queue size (number of operations)
 	DefaultChannelTimeout = 5 * time.Second // Default timeout for Register, Unregister, and Broadcast channel operations
 )
 
@@ -34,9 +34,36 @@ type broadcastItem struct {
 	data []byte
 }
 
+type subscriberOperation struct {
+	sub        Subscriber
+	unregister bool
+}
+
 type redisEnvelope struct {
-	Origin string          `json:"origin"`
-	Data   json.RawMessage `json:"data"`
+	Origin string         `json:"origin"`
+	Data   jsontext.Value `json:"data"`
+}
+
+var (
+	hubDurationMarshalers = jsonv2.MarshalFunc(func(value time.Duration) ([]byte, error) {
+		return strconv.AppendInt(nil, int64(value), 10), nil
+	})
+	hubJSONMarshalOptions = jsonv2.JoinOptions(
+		jsonv2.Deterministic(true),
+		jsonv2.FormatNilMapAsNull(true),
+		jsonv2.FormatNilSliceAsNull(true),
+		jsontext.EscapeForHTML(true),
+		jsonv2.WithMarshalers(hubDurationMarshalers),
+	)
+	hubJSONUnmarshalOptions = jsonv2.MatchCaseInsensitiveNames(true)
+)
+
+func marshalJSON(value any) ([]byte, error) {
+	return jsonv2.Marshal(value, hubJSONMarshalOptions)
+}
+
+func unmarshalJSON(data []byte, value any) error {
+	return jsonv2.Unmarshal(data, value, hubJSONUnmarshalOptions)
 }
 
 // HubOption configures a Hub
@@ -57,7 +84,7 @@ func WithBroadcastBuf(n int) HubOption {
 	}
 }
 
-// WithRegisterBuf sets the register/unregister channel buffer size
+// WithRegisterBuf sets the shared register/unregister queue size
 func WithRegisterBuf(n int) HubOption {
 	return func(h *Hub) {
 		h.registerBuf = n
@@ -110,8 +137,9 @@ func WithOnDisconnect(fn func(Subscriber)) HubOption {
 type Hub struct {
 	subscribers    map[Subscriber]struct{}
 	broadcast      chan broadcastItem
-	register       chan Subscriber
-	unregister     chan Subscriber
+	operation      chan subscriberOperation
+	enqueueMu      sync.RWMutex
+	stopped        bool
 	done           chan struct{}
 	doneOnce       sync.Once
 	clientCount    int64
@@ -144,18 +172,13 @@ func NewHub(opts ...HubOption) *Hub {
 	}
 	h.normalizeOptions()
 	h.broadcast = make(chan broadcastItem, h.broadcastBuf)
-	h.register = make(chan Subscriber, h.registerBuf)
-	h.unregister = make(chan Subscriber, h.registerBuf)
+	h.operation = make(chan subscriberOperation, h.registerBuf)
 	h.done = make(chan struct{})
 	return h
 }
 
 func newRedisID() string {
-	var b [16]byte
-	if _, err := rand.Read(b[:]); err != nil {
-		return strconv.FormatInt(time.Now().UnixNano(), 36)
-	}
-	return hex.EncodeToString(b[:])
+	return uuid.NewV4().String()
 }
 
 func (h *Hub) normalizeOptions() {
@@ -179,17 +202,20 @@ func (h *Hub) Run(ctx context.Context) {
 	if h == nil {
 		return
 	}
-	defer h.closeDone()
+	defer h.stop()
 	if ctx == nil {
-		h.closeSubscribers()
 		return
 	}
 	for {
 		select {
 		case <-ctx.Done():
-			h.closeSubscribers()
 			return
-		case sub := <-h.register:
+		case operation := <-h.operation:
+			sub := operation.sub
+			if operation.unregister {
+				h.unregisterSubscriber(sub)
+				continue
+			}
 			if sub == nil {
 				h.reportError("register", ErrNilSubscriber)
 				continue
@@ -201,10 +227,26 @@ func (h *Hub) Run(ctx context.Context) {
 					h.onConnect(sub)
 				}
 			}
-		case sub := <-h.unregister:
-			h.unregisterSubscriber(sub)
 		case item := <-h.broadcast:
 			h.broadcastToClients(item)
+		}
+	}
+}
+
+func (h *Hub) stop() {
+	h.closeDone()
+	// Wait for enqueuers that started before shutdown, then release queued clients.
+	h.enqueueMu.Lock()
+	h.stopped = true
+	h.enqueueMu.Unlock()
+	for {
+		select {
+		case operation := <-h.operation:
+			operation.sub.Close()
+		case <-h.broadcast:
+		default:
+			h.closeSubscribers()
+			return
 		}
 	}
 }
@@ -238,72 +280,100 @@ func (h *Hub) broadcastToClients(item broadcastItem) {
 	}
 }
 
-func (h *Hub) sendWithTimeout(ch chan<- Subscriber, sub Subscriber, op string) error {
+func (h *Hub) sendWithTimeout(sub Subscriber, op string) error {
 	if h == nil {
 		return ErrNilHub
 	}
 	if sub == nil {
 		return ErrNilSubscriber
 	}
+	h.enqueueMu.RLock()
+	defer h.enqueueMu.RUnlock()
+	if h.stopped {
+		return ErrHubStopped
+	}
 	t := time.NewTimer(h.channelTimeout)
 	defer t.Stop()
 	select {
-	case ch <- sub:
+	case h.operation <- subscriberOperation{sub: sub, unregister: op == "unregister"}:
+		select {
+		case <-h.done:
+			return ErrHubStopped
+		default:
+		}
 		return nil
 	case <-h.done:
 		return ErrHubStopped
 	case <-t.C:
-		err := ErrOperationTimeout
-		if h.onTimeout != nil {
-			h.onTimeout(op)
-		}
-		h.reportError(op, err)
-		return err
+		return ErrOperationTimeout
 	}
 }
 
-func (h *Hub) broadcastWithTimeout(data []byte) error {
+func (h *Hub) broadcastWithTimeout(ctx context.Context, data []byte) error {
 	if h == nil {
 		return ErrNilHub
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	h.enqueueMu.RLock()
+	defer h.enqueueMu.RUnlock()
+	if h.stopped {
+		return ErrHubStopped
 	}
 	t := time.NewTimer(h.channelTimeout)
 	defer t.Stop()
 	select {
 	case h.broadcast <- broadcastItem{data: data}:
+		select {
+		case <-h.done:
+			return ErrHubStopped
+		default:
+		}
 		return nil
 	case <-h.done:
 		return ErrHubStopped
+	case <-ctx.Done():
+		return ctx.Err()
 	case <-t.C:
-		err := ErrOperationTimeout
-		if h.onTimeout != nil {
-			h.onTimeout("broadcast")
-		}
-		h.reportError("broadcast", err)
-		return err
+		return ErrOperationTimeout
 	}
 }
 
-// Register adds the subscriber to the hub. Non-blocking with timeout.
+// Register queues a subscriber for addition. Operations share a FIFO queue with Unregister.
+// A nil error means the operation was queued; Run applies it asynchronously.
 func (h *Hub) Register(sub Subscriber) error {
 	if h == nil {
 		return ErrNilHub
 	}
-	return h.sendWithTimeout(h.register, sub, "register")
+	return h.reportOperation("register", h.sendWithTimeout(sub, "register"))
 }
 
-// Unregister removes the subscriber from the hub. Non-blocking with timeout.
+// Unregister queues removal after any previously queued Register for this subscriber.
+// It can return ErrOperationTimeout when the operation queue stays full.
 func (h *Hub) Unregister(sub Subscriber) error {
 	if h == nil {
 		return ErrNilHub
 	}
-	return h.sendWithTimeout(h.unregister, sub, "unregister")
+	return h.reportOperation("unregister", h.sendWithTimeout(sub, "unregister"))
 }
 
 // Broadcast sends data to all connected subscribers. Non-blocking with timeout.
 func (h *Hub) Broadcast(data []byte) error {
 	payload := make([]byte, len(data))
 	copy(payload, data)
-	return h.broadcastWithTimeout(payload)
+	return h.reportOperation("broadcast", h.broadcastWithTimeout(context.Background(), payload))
+}
+
+// User callbacks run after enqueue locks have been released.
+func (h *Hub) reportOperation(op string, err error) error {
+	if errors.Is(err, ErrOperationTimeout) {
+		if h.onTimeout != nil {
+			h.onTimeout(op)
+		}
+		h.reportError(op, err)
+	}
+	return err
 }
 
 // BroadcastEvent marshals event as JSON, broadcasts it locally, and publishes it to Redis when configured.
@@ -314,11 +384,11 @@ func (h *Hub) BroadcastEvent(ctx context.Context, event any) error {
 	if ctx == nil {
 		return ErrNilContext
 	}
-	data, err := json.Marshal(event)
+	data, err := marshalJSON(event)
 	if err != nil {
 		return err
 	}
-	localErr := h.Broadcast(data)
+	localErr := h.reportOperation("broadcast", h.broadcastWithTimeout(ctx, data))
 	if h.redisClient != nil && h.redisChannel != "" {
 		pubCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
 		err := h.redisClient.Publish(pubCtx, h.redisChannel, h.wrapRedisPayload(data)).Err()
@@ -345,27 +415,30 @@ func (h *Hub) SubscribeToRedis(ctx context.Context) {
 	backoff := time.Second
 	const maxBackoff = 30 * time.Second
 	for {
+		if ctx.Err() != nil {
+			return
+		}
 		pubsub := h.redisClient.Subscribe(ctx, h.redisChannel)
+		// Closing the subscription also interrupts an idle Receive or Channel read.
+		stop := context.AfterFunc(ctx, func() { _ = pubsub.Close() })
 		if _, err := pubsub.Receive(ctx); err != nil {
-			h.reportError("redis_subscribe", err)
+			stop()
 			_ = pubsub.Close()
+			if ctx.Err() != nil {
+				return
+			}
+			h.reportError("redis_subscribe", err)
 			if !h.waitRedisBackoff(ctx, backoff) {
 				return
 			}
 			backoff = nextBackoff(backoff, maxBackoff)
 			continue
 		}
-		ch := pubsub.Channel()
-		for msg := range ch {
-			payload, ok := h.unwrapRedisPayload(msg.Payload)
-			if ok {
-				if err := h.Broadcast(payload); err != nil {
-					h.reportError("redis_broadcast", err)
-				}
-			}
-			backoff = time.Second // reset on success
+		if h.forwardRedisMessages(ctx, pubsub.Channel()) {
+			backoff = time.Second
 		}
-		if err := pubsub.Close(); err != nil {
+		stop()
+		if err := pubsub.Close(); err != nil && ctx.Err() == nil {
 			h.reportError("redis_close", err)
 		}
 		if ctx.Err() != nil {
@@ -379,6 +452,34 @@ func (h *Hub) SubscribeToRedis(ctx context.Context) {
 	}
 }
 
+func (h *Hub) forwardRedisMessages(ctx context.Context, messages <-chan *redis.Message) bool {
+	received := false
+	for {
+		var msg *redis.Message
+		select {
+		case <-ctx.Done():
+			return received
+		case next, ok := <-messages:
+			if !ok {
+				return received
+			}
+			msg = next
+		}
+		received = true
+		payload, ok := h.unwrapRedisPayload(msg.Payload)
+		if !ok {
+			continue
+		}
+		err := h.reportOperation("broadcast", h.broadcastWithTimeout(ctx, payload))
+		if ctx.Err() != nil {
+			return received
+		}
+		if err != nil {
+			h.reportError("redis_broadcast", err)
+		}
+	}
+}
+
 // SubscriberCount returns the number of registered subscribers
 func (h *Hub) SubscriberCount() int {
 	if h == nil {
@@ -388,9 +489,9 @@ func (h *Hub) SubscriberCount() int {
 }
 
 func (h *Hub) wrapRedisPayload(data []byte) []byte {
-	payload, err := json.Marshal(redisEnvelope{
+	payload, err := marshalJSON(redisEnvelope{
 		Origin: h.redisID,
-		Data:   json.RawMessage(data),
+		Data:   jsontext.Value(data),
 	})
 	if err != nil {
 		return data
@@ -400,7 +501,7 @@ func (h *Hub) wrapRedisPayload(data []byte) []byte {
 
 func (h *Hub) unwrapRedisPayload(payload string) ([]byte, bool) {
 	var envelope redisEnvelope
-	if err := json.Unmarshal([]byte(payload), &envelope); err == nil && len(envelope.Data) > 0 {
+	if err := unmarshalJSON([]byte(payload), &envelope); err == nil && len(envelope.Data) > 0 {
 		if envelope.Origin == h.redisID {
 			return nil, false
 		}

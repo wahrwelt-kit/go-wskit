@@ -4,7 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
-	"encoding/json"
+	"encoding/json/jsontext"
 	"errors"
 	"net/http"
 	"net/http/httptest"
@@ -62,7 +62,7 @@ func readJSON(t *testing.T, conn *websocket.Conn, dst any) {
 	if err != nil {
 		t.Fatalf("read: %v", err)
 	}
-	if err := json.Unmarshal(data, dst); err != nil {
+	if err := unmarshalJSON(data, dst); err != nil {
 		t.Fatalf("unmarshal: %v", err)
 	}
 }
@@ -117,7 +117,7 @@ func TestNewEvent(t *testing.T) {
 func TestHub_OnConnect(t *testing.T) {
 	t.Parallel()
 	hub, _ := startTestHub(t, WithOnConnect(func(sub Subscriber) {
-		data, _ := json.Marshal(NewEvent("welcome", nil))
+		data, _ := marshalJSON(NewEvent("welcome", nil))
 		sub.Send(data)
 	}))
 	srv := startTestServer(t, hub)
@@ -207,6 +207,70 @@ func TestHub_BroadcastEvent(t *testing.T) {
 	readJSON(t, conn, &ev)
 	if ev.Type != "notify" {
 		t.Fatalf("expected notify, got %q", ev.Type)
+	}
+}
+
+func TestHub_BroadcastEvent_JSONV2WireCompatibility(t *testing.T) {
+	t.Parallel()
+	hub, _ := startTestHub(t)
+	sub := NewSSEClient(1)
+	if err := hub.Register(sub); err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+	waitForClients(t, hub, 1)
+
+	type payload struct {
+		Duration     time.Duration  `json:"duration"`
+		ZeroDuration time.Duration  `json:"zeroDuration,omitempty"`
+		OmitZero     time.Duration  `json:"omitZero,omitzero"`
+		NilMap       map[string]int `json:"nilMap"`
+		NilSlice     []string       `json:"nilSlice"`
+		HTML         string         `json:"html"`
+	}
+	event := Event{
+		Type:      "wire",
+		Payload:   payload{Duration: 1500 * time.Millisecond, NilMap: nil, NilSlice: nil, HTML: "<tag>"},
+		Timestamp: time.Unix(0, 0).UTC(),
+	}
+	if err := hub.BroadcastEvent(context.Background(), event); err != nil {
+		t.Fatalf("BroadcastEvent: %v", err)
+	}
+
+	select {
+	case data := <-sub.send:
+		var got struct {
+			Payload jsontext.Value `json:"payload"`
+		}
+		if err := unmarshalJSON(data, &got); err != nil {
+			t.Fatalf("unmarshal event: %v", err)
+		}
+		want := `{"duration":1500000000,"zeroDuration":0,"nilMap":null,"nilSlice":null,"html":"\u003ctag\u003e"}`
+		if string(got.Payload) != want {
+			t.Fatalf("payload = %s, want %s", got.Payload, want)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timeout waiting for broadcast")
+	}
+}
+
+func TestHub_BroadcastEvent_RejectsDuplicateNamesAndInvalidUTF8(t *testing.T) {
+	t.Parallel()
+	hub, _ := startTestHub(t)
+	tests := []struct {
+		name    string
+		payload jsontext.Value
+	}{
+		{name: "duplicate names", payload: jsontext.Value(`{"value":1,"value":2}`)},
+		{name: "invalid UTF-8", payload: jsontext.Value([]byte{'{', '"', 'v', '"', ':', '"', 0xff, '"', '}'})},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			err := hub.BroadcastEvent(context.Background(), NewEvent("strict", tt.payload))
+			if err == nil {
+				t.Fatal("BroadcastEvent accepted invalid JSON payload")
+			}
+		})
 	}
 }
 
@@ -631,6 +695,30 @@ func TestHub_RedisEnvelopeSkipsOwnOrigin(t *testing.T) {
 	}
 }
 
+func TestHub_UnwrapRedisPayloadFallbackForInvalidEnvelope(t *testing.T) {
+	t.Parallel()
+	hub := NewHub()
+	tests := []struct {
+		name    string
+		payload []byte
+	}{
+		{name: "duplicate names", payload: []byte(`{"type":"first","type":"second"}`)},
+		{name: "invalid UTF-8", payload: []byte{'{', '"', 't', '"', ':', '"', 0xff, '"', '}'}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			got, ok := hub.unwrapRedisPayload(string(tt.payload))
+			if !ok {
+				t.Fatal("unwrapRedisPayload rejected raw fallback")
+			}
+			if !bytes.Equal(got, tt.payload) {
+				t.Fatalf("fallback = %q, want original %q", got, tt.payload)
+			}
+		})
+	}
+}
+
 func TestHub_BroadcastEvent_NilContext(t *testing.T) {
 	t.Parallel()
 	hub := NewHub()
@@ -915,7 +1003,7 @@ func TestAcceptSSE_BasicFlow(t *testing.T) {
 	}
 
 	var ev Event
-	if err := json.Unmarshal([]byte(got), &ev); err != nil {
+	if err := unmarshalJSON([]byte(got), &ev); err != nil {
 		t.Fatalf("unmarshal SSE: %v", err)
 	}
 	if ev.Type != "sse-test" {
@@ -1005,7 +1093,7 @@ func TestHub_MixedSubscribers(t *testing.T) {
 			if after, ok := strings.CutPrefix(line, "data: "); ok {
 				got := after
 				var sseEv Event
-				if err := json.Unmarshal([]byte(got), &sseEv); err != nil {
+				if err := unmarshalJSON([]byte(got), &sseEv); err != nil {
 					t.Fatalf("unmarshal SSE: %v", err)
 				}
 				if sseEv.Type != "mixed" {

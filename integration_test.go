@@ -4,9 +4,9 @@ package wskit
 
 import (
 	"context"
-	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"testing"
 	"time"
 
@@ -19,6 +19,12 @@ import (
 
 func startRedis(t *testing.T) *redis.Client {
 	t.Helper()
+	if address := os.Getenv("WSKIT_TEST_REDIS_ADDR"); address != "" {
+		client := redis.NewClient(&redis.Options{Addr: address})
+		t.Cleanup(func() { _ = client.Close() })
+		require.NoError(t, client.Ping(t.Context()).Err())
+		return client
+	}
 	ctx := context.Background()
 	container, err := tcredis.Run(ctx, "redis:7-alpine")
 	require.NoError(t, err)
@@ -31,6 +37,58 @@ func startRedis(t *testing.T) *redis.Client {
 	t.Cleanup(func() { _ = client.Close() })
 	require.NoError(t, client.Ping(ctx).Err())
 	return client
+}
+
+func TestIntegration_Redis_CancelIdleSubscription(t *testing.T) {
+	client := startRedis(t)
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	channel := "test:cancel-idle"
+	hub := NewHub(WithRedis(client, channel))
+	done := make(chan struct{})
+	go func() { defer close(done); hub.SubscribeToRedis(ctx) }()
+	defer func() { cancel(); _ = client.Close(); <-done }()
+	waitForSubscription(t, client, channel)
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("idle Redis subscription ignored cancellation")
+	}
+	require.Eventually(t, func() bool {
+		counts, err := client.PubSubNumSub(t.Context(), channel).Result()
+		return err == nil && counts[channel] == 0
+	}, time.Second, 10*time.Millisecond, "Redis subscription still connected")
+}
+
+func TestIntegration_Redis_CancelBlockedBroadcast(t *testing.T) {
+	client := startRedis(t)
+	ctx, cancel := context.WithCancel(t.Context())
+	channel := "test:cancel-blocked"
+	hub := NewHub(WithRedis(client, channel), WithBroadcastBuf(0))
+	done := make(chan struct{})
+	go func() { defer close(done); hub.SubscribeToRedis(ctx) }()
+	defer func() {
+		cancel()
+		hub.Run(nil) //nolint:staticcheck // release a blocked broadcast even when the assertion fails
+		_ = client.Close()
+		<-done
+	}()
+	waitForSubscription(t, client, channel)
+	require.NoError(t, client.Publish(t.Context(), channel, `{"type":"event"}`).Err())
+	require.Eventually(t, func() bool {
+		if !hub.enqueueMu.TryLock() {
+			return true
+		}
+		hub.enqueueMu.Unlock()
+		return false
+	}, time.Second, time.Millisecond, "Redis message did not reach the full broadcast queue")
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("blocked Redis broadcast ignored cancellation")
+	}
 }
 
 func startIntegrationHub(t *testing.T, redisClient *redis.Client, channel string, opts ...HubOption) (*Hub, context.CancelFunc) {
@@ -100,7 +158,7 @@ func readEvent(t *testing.T, conn *websocket.Conn) Event {
 	_, data, err := conn.Read(ctx)
 	require.NoError(t, err)
 	var ev Event
-	require.NoError(t, json.Unmarshal(data, &ev))
+	require.NoError(t, unmarshalJSON(data, &ev))
 	return ev
 }
 
@@ -244,7 +302,7 @@ func TestIntegration_Redis_OnConnect(t *testing.T) {
 	t.Parallel()
 	rc := startRedis(t)
 	hub, _ := startIntegrationHub(t, rc, "test:onconnect", WithOnConnect(func(sub Subscriber) {
-		data, _ := json.Marshal(NewEvent("welcome", nil))
+		data, _ := marshalJSON(NewEvent("welcome", nil))
 		sub.Send(data)
 	}))
 	srv := startIntegrationServer(t, hub)

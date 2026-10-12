@@ -6,7 +6,11 @@
 
 WebSocket hub-and-spoke server on [coder/websocket](https://github.com/coder/websocket) with optional Redis Pub/Sub for multi-instance broadcast.
 
+Event and Redis envelope JSON use `encoding/json/v2`, with raw envelope data represented by `jsontext.Value`. Nil maps and slices remain `null`, map keys are deterministic, and `time.Duration` values remain integer nanoseconds. `BroadcastEvent` rejects JSON values with duplicate names or invalid UTF-8. Redis Pub/Sub envelope parsing uses strict v2 decoding, while its existing parse-error fallback forwards the original raw payload as an event. Case-insensitive envelope field matching also treats `_` and `-` as separators, broader than v1 matching. V2 `omitempty` checks JSON emptiness; use `omitzero` to omit zero numeric and duration values.
+
 ## Install
+
+Requires Go 1.27.2 or later.
 
 ```bash
 go get github.com/wahrwelt-kit/go-wskit
@@ -18,7 +22,7 @@ import "github.com/wahrwelt-kit/go-wskit"
 
 ## Features
 
-- **Hub** - single-goroutine dispatcher with register/unregister/broadcast channels, graceful shutdown via context, atomic subscriber count, and explicit operation errors
+- **Hub** - single-goroutine dispatcher with a FIFO register/unregister queue and a separate broadcast queue, graceful shutdown via context, atomic subscriber count, and explicit operation errors
 - **Client** - ReadPump (optional inbound message handler) + WritePump (send + ping), safe concurrent Send with close protection
 - **SSEClient** - Server-Sent Events subscriber; `AcceptSSE` registers it with the hub and writes protocol-safe `data:` frames until disconnect or shutdown
 - **Redis Pub/Sub** - BroadcastEvent delivers locally first, publishes to Redis for other instances, and avoids duplicate local echo from the same hub
@@ -29,6 +33,8 @@ import "github.com/wahrwelt-kit/go-wskit"
 ## Example
 
 ```go
+import jsonv2 "encoding/json/v2"
+
 hub := wskit.NewHub(
     wskit.WithRedis(redisClient, "ws:events"),
     wskit.WithOnDrop(func(sub wskit.Subscriber, data []byte) {
@@ -38,7 +44,7 @@ hub := wskit.NewHub(
         log.Printf("websocket %s: %v", op, err)
     }),
     wskit.WithOnConnect(func(sub wskit.Subscriber) {
-        data, _ := json.Marshal(wskit.NewEvent("connected", nil))
+        data, _ := jsonv2.Marshal(wskit.NewEvent("connected", nil))
         sub.Send(data)
     }),
 )
@@ -72,3 +78,8 @@ if err := hub.BroadcastJSON(ctx, "notification", map[string]string{"message": "h
 **Hub:** `WithRedis`, `WithBroadcastBuf`, `WithRegisterBuf`, `WithChannelTimeout`, `WithOnTimeout`, `WithOnDrop`, `WithOnError`, `WithOnConnect`, `WithOnDisconnect`
 
 **Client:** `WithWriteWait`, `WithPingInterval`, `WithMaxMessageSize`, `WithSendBufSize`, `WithMessageHandler`
+
+Register and Unregister return after queuing an operation. Run applies them in order.
+Shutdown closes registered and pending subscribers; later operations return
+`ErrHubStopped`. Redis subscription cancellation interrupts idle reads and waits
+for broadcast queue space.
